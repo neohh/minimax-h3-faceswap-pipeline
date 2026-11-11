@@ -1,0 +1,7 @@
+*.mp4
+*.onnx
+*.safetensors
+__pycache__/
+*.pyc
+.venv/
+.DS_Store

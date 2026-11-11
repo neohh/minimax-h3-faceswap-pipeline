@@ -1,0 +1,701 @@
+{
+  "model": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "shift": {
+    "class_type": "MiniMaxH3SigmaShift",
+    "inputs": {
+      "shift_video": 12.0,
+      "shift_audio": 3.0,
+      "model": [
+        "model",
+        0
+      ]
+    }
+  },
+  "attention": {
+    "class_type": "ModelAttentionBackend",
+    "inputs": {
+      "attention": "comfy kitchen attention",
+      "model": [
+        "shift",
+        0
+      ]
+    }
+  },
+  "text": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "type": "minimax",
+      "device": "default"
+    }
+  },
+  "text_device": {
+    "class_type": "SelectCLIPDevice",
+    "inputs": {
+      "device": "gpu:0",
+      "clip": [
+        "text",
+        0
+      ]
+    }
+  },
+  "text_memory": {
+    "class_type": "H3RelayTextMemory",
+    "inputs": {
+      "clip": [
+        "text_device",
+        0
+      ]
+    }
+  },
+  "video_vae": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    }
+  },
+  "audio_vae": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    }
+  },
+  "turbo": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+      "strength_model": 1.0,
+      "model": [
+        "attention",
+        0
+      ]
+    }
+  },
+  "adapter": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "lora_name": "h3-v2-challenge-eval-20261013/v2-1000.safetensors",
+      "strength_model": 1.0,
+      "model": [
+        "turbo",
+        0
+      ]
+    }
+  },
+  "source": {
+    "class_type": "LoadVideo",
+    "inputs": {
+      "file": "source.mp4",
+      "upload": "image"
+    }
+  },
+  "prepare": {
+    "class_type": "H3RelayPrepareSource",
+    "inputs": {
+      "resolution": "768",
+      "duration_seconds": 0.0,
+      "missing_audio": "silence",
+      "video": [
+        "source",
+        0
+      ]
+    }
+  },
+  "dimensions": {
+    "class_type": "GetImageSize",
+    "inputs": {
+      "image": [
+        "prepare",
+        0
+      ]
+    }
+  },
+  "reference": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "reference.png",
+      "upload": "image"
+    }
+  },
+  "sam": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "sam3.1_multiplex_fp16.safetensors"
+    }
+  },
+  "subject": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "person",
+      "clip": [
+        "sam",
+        1
+      ]
+    }
+  },
+  "first_frame": {
+    "class_type": "ImageFromBatch",
+    "inputs": {
+      "batch_index": 0,
+      "length": 1,
+      "image": [
+        "prepare",
+        0
+      ]
+    }
+  },
+  "detect": {
+    "class_type": "SAM3_Detect",
+    "inputs": {
+      "threshold": 0.35,
+      "refine_iterations": 2,
+      "individual_masks": true,
+      "model": [
+        "sam",
+        0
+      ],
+      "image": [
+        "first_frame",
+        0
+      ],
+      "conditioning": [
+        "subject",
+        0
+      ]
+    }
+  },
+  "select": {
+    "class_type": "H3RelaySelectMask",
+    "inputs": {
+      "selection": "largest",
+      "index": 0,
+      "masks": [
+        "detect",
+        0
+      ]
+    }
+  },
+  "track": {
+    "class_type": "SAM3_VideoTrack",
+    "inputs": {
+      "detection_threshold": 0.5,
+      "max_objects": 1,
+      "detect_interval": 1,
+      "images": [
+        "prepare",
+        0
+      ],
+      "model": [
+        "sam",
+        0
+      ],
+      "initial_mask": [
+        "select",
+        0
+      ],
+      "conditioning": [
+        "subject",
+        0
+      ]
+    }
+  },
+  "mask": {
+    "class_type": "SAM3_TrackToMask",
+    "inputs": {
+      "object_indices": "",
+      "track_data": [
+        "track",
+        0
+      ]
+    }
+  },
+  "recover": {
+    "class_type": "H3RelayRecoverMasks",
+    "inputs": {
+      "source_frames": [
+        "prepare",
+        5
+      ],
+      "recover_empty_frames": true,
+      "masks": [
+        "mask",
+        0
+      ],
+      "images": [
+        "prepare",
+        0
+      ],
+      "model": [
+        "sam",
+        0
+      ],
+      "conditioning": [
+        "subject",
+        0
+      ],
+      "selection": [
+        "select",
+        1
+      ]
+    }
+  },
+  "expand_mask": {
+    "class_type": "H3RelayExpandMask",
+    "inputs": {
+      "source_frames": [
+        "prepare",
+        5
+      ],
+      "expansion_px": 8,
+      "masks": [
+        "user_mask_to_mask",
+        0
+      ],
+      "images": [
+        "prepare",
+        0
+      ]
+    }
+  },
+  "mask_preview": {
+    "class_type": "PreviewImage",
+    "inputs": {
+      "images": [
+        "expand_mask",
+        1
+      ]
+    }
+  },
+  "plan": {
+    "class_type": "H3RelayWindowPlan",
+    "inputs": {
+      "source_frames": [
+        "prepare",
+        5
+      ],
+      "window_frames": "56",
+      "history_frames": "18",
+      "seed": 904239,
+      "control_after_generate": "fixed",
+      "schedule": "adaptive",
+      "seed_mode": "fixed",
+      "seed_overrides": "{}"
+    }
+  },
+  "start": {
+    "class_type": "StartLoop",
+    "inputs": {
+      "mode": "simple",
+      "mode.num_iterations": [
+        "plan",
+        2
+      ],
+      "cache_iterations": false
+    },
+    "_loop_body": [
+      "append",
+      "decode",
+      "edit_mask",
+      "encode_source",
+      "guide",
+      "guider",
+      "history",
+      "noise",
+      "reference_conditioning",
+      "sample",
+      "sampling_memory",
+      "separate",
+      "window"
+    ],
+    "_loop_end": "end"
+  },
+  "window": {
+    "class_type": "H3RelayWindowInputs",
+    "inputs": {
+      "reference_history": true,
+      "fps": 24.0,
+      "history_audio_mode": "source",
+      "iteration_index": [
+        "start",
+        0
+      ],
+      "resize_anchor": true,
+      "source": [
+        "prepare",
+        0
+      ],
+      "window": [
+        "plan",
+        3
+      ],
+      "previous": [
+        "start",
+        4
+      ],
+      "source_audio": [
+        "prepare",
+        1
+      ],
+      "mask": [
+        "expand_mask",
+        0
+      ]
+    }
+  },
+  "reference_conditioning": {
+    "class_type": "MiniMaxH3ReferenceToVideo",
+    "inputs": {
+      "prompt": "Replace the selected person with the reference character. Preserve source performance, scene and audio timing.",
+      "width": [
+        "dimensions",
+        0
+      ],
+      "height": [
+        "dimensions",
+        1
+      ],
+      "length": [
+        "window",
+        8
+      ],
+      "ref_image_size": "match",
+      "clip": [
+        "text_memory",
+        0
+      ],
+      "vae": [
+        "video_vae",
+        0
+      ],
+      "audio_vae": [
+        "audio_vae",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "reference",
+        0
+      ],
+      "ref_videos.ref_video_0": [
+        "window",
+        5
+      ],
+      "ref_audios.ref_audio_0": [
+        "window",
+        6
+      ]
+    }
+  },
+  "history": {
+    "class_type": "H3RelayApplyHistory",
+    "inputs": {
+      "history_frames": [
+        "window",
+        7
+      ],
+      "first_frame_guide": false,
+      "target_audio_guide": true,
+      "positive": [
+        "reference_conditioning",
+        0
+      ],
+      "latent": [
+        "reference_conditioning",
+        1
+      ],
+      "vae": [
+        "video_vae",
+        0
+      ],
+      "audio_vae": [
+        "audio_vae",
+        0
+      ],
+      "frames": [
+        "window",
+        3
+      ],
+      "audio": [
+        "window",
+        4
+      ]
+    }
+  },
+  "encode_source": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "window",
+        0
+      ],
+      "vae": [
+        "video_vae",
+        0
+      ]
+    }
+  },
+  "edit_mask": {
+    "class_type": "H3RelayApplyEditMask",
+    "inputs": {
+      "latent": [
+        "history",
+        1
+      ],
+      "source_latent": [
+        "encode_source",
+        0
+      ],
+      "mask": [
+        "window",
+        1
+      ]
+    }
+  },
+  "guide": {
+    "class_type": "MiniMaxH3AddGuide",
+    "inputs": {
+      "frame_idx": 0,
+      "positive": [
+        "history",
+        0
+      ],
+      "latent": [
+        "edit_mask",
+        0
+      ],
+      "audio_vae": [
+        "audio_vae",
+        0
+      ],
+      "audio": [
+        "window",
+        2
+      ]
+    }
+  },
+  "sampling_memory": {
+    "class_type": "H3RelaySamplingMemory",
+    "inputs": {
+      "activation_memory_gib": 17.0,
+      "model": [
+        "adapter",
+        0
+      ],
+      "latent": [
+        "edit_mask",
+        0
+      ],
+      "conditioning": [
+        "guide",
+        0
+      ]
+    }
+  },
+  "noise": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": [
+        "window",
+        10
+      ],
+      "control_after_generate": "fixed"
+    }
+  },
+  "guider": {
+    "class_type": "CFGGuider",
+    "inputs": {
+      "cfg": 1.0,
+      "model": [
+        "sampling_memory",
+        0
+      ],
+      "positive": [
+        "guide",
+        0
+      ],
+      "negative": [
+        "guide",
+        0
+      ]
+    }
+  },
+  "sampler": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "er_sde"
+    }
+  },
+  "schedule": {
+    "class_type": "BasicScheduler",
+    "inputs": {
+      "scheduler": "normal",
+      "steps": 8,
+      "denoise": 1.0,
+      "model": [
+        "adapter",
+        0
+      ]
+    }
+  },
+  "sample": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": [
+        "noise",
+        0
+      ],
+      "guider": [
+        "guider",
+        0
+      ],
+      "sampler": [
+        "sampler",
+        0
+      ],
+      "sigmas": [
+        "schedule",
+        0
+      ],
+      "latent_image": [
+        "edit_mask",
+        0
+      ]
+    }
+  },
+  "separate": {
+    "class_type": "LTXVSeparateAVLatent",
+    "inputs": {
+      "av_latent": [
+        "sample",
+        0
+      ]
+    }
+  },
+  "decode": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "separate",
+        0
+      ],
+      "vae": [
+        "video_vae",
+        0
+      ]
+    }
+  },
+  "append": {
+    "class_type": "H3RelayAppendWindow",
+    "inputs": {
+      "frames": [
+        "decode",
+        0
+      ],
+      "window": [
+        "window",
+        12
+      ],
+      "previous": [
+        "start",
+        4
+      ]
+    }
+  },
+  "end": {
+    "class_type": "EndLoop",
+    "inputs": {
+      "accumulate": false,
+      "output_value": [
+        "append",
+        0
+      ],
+      "next_iteration_value": [
+        "append",
+        0
+      ]
+    }
+  },
+  "finish": {
+    "class_type": "H3RelayFinishWindows",
+    "inputs": {
+      "audio_mode": "source",
+      "state": [
+        "end",
+        0
+      ],
+      "source_audio": [
+        "prepare",
+        1
+      ]
+    }
+  },
+  "video": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "fps": [
+        "finish",
+        2
+      ],
+      "bit_depth": "auto",
+      "color_space": "sRGB",
+      "codec": "none",
+      "images": [
+        "finish",
+        0
+      ],
+      "audio": [
+        "finish",
+        1
+      ]
+    }
+  },
+  "save": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "filename_prefix": "h3-relay/turn_swap",
+      "format": "mp4",
+      "format.codec": "h264",
+      "format.codec.encoding": "re-encode",
+      "format.codec.encoding.crf": 16.0,
+      "codec": "auto",
+      "video": [
+        "video",
+        0
+      ]
+    }
+  },
+  "user_mask_video": {
+    "class_type": "LoadVideo",
+    "inputs": {
+      "file": "mask.mp4",
+      "upload": "image"
+    }
+  },
+  "user_mask_prepare": {
+    "class_type": "H3RelayPrepareSource",
+    "inputs": {
+      "resolution": "768",
+      "duration_seconds": 0.0,
+      "missing_audio": "silence",
+      "video": [
+        "user_mask_video",
+        0
+      ]
+    }
+  },
+  "user_mask_to_mask": {
+    "class_type": "ImageToMask",
+    "inputs": {
+      "image": [
+        "user_mask_prepare",
+        0
+      ],
+      "channel": "red"
+    }
+  }
+}
