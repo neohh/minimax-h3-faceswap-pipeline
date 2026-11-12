@@ -216,7 +216,7 @@ def step4_pixel_perfect_composite(source_video, mask_video, tubes_matte, swapped
     print("\n[Step 4] Pixel-perfect native compositing...")
     cap_full = cv2.VideoCapture(source_video)
     cap_mask = cv2.VideoCapture(mask_video)
-    cap_tubes = cv2.VideoCapture(tubes_matte) if tubes_matte else None
+    cap_tubes = cv2.VideoCapture(tubes_matte) if (tubes_matte and os.path.exists(tubes_matte)) else None
     
     cap_full.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     cap_mask.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -248,9 +248,9 @@ def step4_pixel_perfect_composite(source_video, mask_video, tubes_matte, swapped
         fm_smooth = cv2.GaussianBlur(fm_dilated.astype(np.float32) / 255.0, (25, 25), 0)
         
         # Proper VFX Holdout Matte: tubes subtract from face mask alpha with anti-aliasing
-        if cap_tubes:
+        if cap_tubes and cap_tubes.isOpened():
             r3, ft = cap_tubes.read()
-            if r3:
+            if r3 and ft is not None:
                 tm_gray = cv2.cvtColor(ft, cv2.COLOR_BGR2GRAY)
                 if tm_gray.shape[:2] != (h_full, w_full):
                     tm_gray = cv2.resize(tm_gray, (w_full, h_full))
