@@ -83,8 +83,8 @@ def step1_prepare_crop(source_video, mask_video, start_frame=0, num_frames=56, c
     wr_s.release()
     wr_m.release()
     
-    os.system("docker exec comfyui ffmpeg -y -i /opt/comfyui/input/temp_crop_s_raw.mp4 -c:v libx264 -pix_fmt yuv420p /opt/comfyui/input/source.mp4")
-    os.system("docker exec comfyui ffmpeg -y -i /opt/comfyui/input/temp_crop_m.mp4 -c:v libx264 -pix_fmt yuv420p /opt/comfyui/input/mask.mp4")
+    os.system("docker exec comfyui ffmpeg -y -i /opt/comfyui/input/temp_crop_s_raw.mp4 -c:v libx264 -pix_fmt yuv420p -movflags +faststart /opt/comfyui/input/source.mp4")
+    os.system("docker exec comfyui ffmpeg -y -i /opt/comfyui/input/temp_crop_m_raw.mp4 -c:v libx264 -pix_fmt yuv420p -movflags +faststart /opt/comfyui/input/mask.mp4")
     print("Prepared /opt/comfyui/input/source.mp4 and mask.mp4")
     return crop_box, (w_orig, h_orig), fps
 
@@ -99,7 +99,8 @@ def step2_generate_minimax_h3(workflow_json, comfy_url="http://127.0.0.1:8188", 
         
     prompt_dict["save"]["inputs"]["filename_prefix"] = prefix
     seed = random.randint(100000, 999999999)
-    prompt_dict["noise"]["inputs"]["noise_seed"] = seed
+    if "plan" in prompt_dict and "seed" in prompt_dict["plan"]["inputs"]:
+        prompt_dict["plan"]["inputs"]["seed"] = seed
     
     req_data = json.dumps({"prompt": prompt_dict}).encode("utf-8")
     req = urllib.request.Request(f"{comfy_url}/prompt", data=req_data, headers={"Content-Type": "application/json"})
@@ -191,7 +192,8 @@ def step3_rock_solid_inswapper(input_video, ref_image, output_swapped_video, ins
             self.kps = kps
             self.bbox = bbox
             
-    tmp_raw = os.path.join(os.path.dirname(output_swapped_video), "temp_swap_raw.mp4")
+    comfy_out = r"C:\Work\docker\ComfyUI\output"
+    tmp_raw = os.path.join(comfy_out, "temp_swap_raw.mp4")
     out = cv2.VideoWriter(tmp_raw, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
     swapped_frames = []
     for i in range(len(frames)):
@@ -201,8 +203,8 @@ def step3_rock_solid_inswapper(input_video, ref_image, output_swapped_video, ins
         swapped_frames.append(swapped)
     out.release()
     
-    tmp_h264 = os.path.join(os.path.dirname(output_swapped_video), "temp_swap_h264.mp4")
-    os.system(f"docker exec comfyui ffmpeg -y -i /opt/comfyui/output/temp_swap_raw.mp4 -c:v libx264 -pix_fmt yuv420p /opt/comfyui/output/temp_swap_h264.mp4")
+    tmp_h264 = os.path.join(comfy_out, "temp_swap_h264.mp4")
+    os.system(f"docker exec comfyui ffmpeg -y -i /opt/comfyui/output/temp_swap_raw.mp4 -c:v libx264 -pix_fmt yuv420p -movflags +faststart /opt/comfyui/output/temp_swap_h264.mp4")
     shutil.copy2(tmp_h264, output_swapped_video)
     return swapped_frames
 
@@ -226,9 +228,11 @@ def step4_pixel_perfect_composite(source_video, mask_video, tubes_matte, swapped
     x1, y1, sz = crop_box
     x2, y2 = x1 + sz, y1 + sz
     
-    tmp_comp_raw = os.path.join(os.path.dirname(output_master_video), "temp_comp_raw.mp4")
+    comfy_out = r"C:\Work\docker\ComfyUI\output"
+    tmp_comp_raw = os.path.join(comfy_out, "temp_comp_raw.mp4")
     out = cv2.VideoWriter(tmp_comp_raw, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w_full, h_full))
     
+    # Hair-friendly edge dilation and smoothing
     kernel = np.ones((25, 25), np.uint8)
     
     for i in range(len(swapped_frames)):
@@ -242,20 +246,25 @@ def step4_pixel_perfect_composite(source_video, mask_video, tubes_matte, swapped
         fm_box = fm[y1:y2, x1:x2, 0]
         fm_dilated = cv2.dilate(fm_box, kernel, iterations=1)
         fm_smooth = cv2.GaussianBlur(fm_dilated.astype(np.float32) / 255.0, (25, 25), 0)
-        m_3d = np.repeat(fm_smooth[:, :, np.newaxis], 3, axis=2)
         
-        roi = ff[y1:y2, x1:x2].astype(np.float32)
-        ff[y1:y2, x1:x2] = (fc_native.astype(np.float32) * m_3d + roi * (1.0 - m_3d)).astype(np.uint8)
-        
+        # Proper VFX Holdout Matte: tubes subtract from face mask alpha with anti-aliasing
         if cap_tubes:
             r3, ft = cap_tubes.read()
             if r3:
                 tm_gray = cv2.cvtColor(ft, cv2.COLOR_BGR2GRAY)
                 if tm_gray.shape[:2] != (h_full, w_full):
                     tm_gray = cv2.resize(tm_gray, (w_full, h_full))
-                m_tubes = (tm_gray.astype(np.float32) / 255.0)[:, :, np.newaxis]
-                ff = (clean_bg.astype(np.float32) * m_tubes + ff.astype(np.float32) * (1.0 - m_tubes)).astype(np.uint8)
-                
+                tm_box = tm_gray[y1:y2, x1:x2].astype(np.float32) / 255.0
+                tm_soft = cv2.GaussianBlur(tm_box, (7, 7), 0)
+                m_holdout = np.clip(fm_smooth * (1.0 - tm_soft), 0.0, 1.0)
+            else:
+                m_holdout = fm_smooth
+        else:
+            m_holdout = fm_smooth
+            
+        m_3d = np.repeat(m_holdout[:, :, np.newaxis], 3, axis=2)
+        roi = ff[y1:y2, x1:x2].astype(np.float32)
+        ff[y1:y2, x1:x2] = (fc_native.astype(np.float32) * m_3d + roi * (1.0 - m_3d)).astype(np.uint8)
         out.write(ff)
         
     cap_full.release()
@@ -263,8 +272,8 @@ def step4_pixel_perfect_composite(source_video, mask_video, tubes_matte, swapped
     if cap_tubes: cap_tubes.release()
     out.release()
     
-    tmp_comp_h264 = os.path.join(os.path.dirname(output_master_video), "temp_comp_h264.mp4")
-    os.system(f"docker exec comfyui ffmpeg -y -i /opt/comfyui/output/temp_comp_raw.mp4 -c:v libx264 -pix_fmt yuv420p /opt/comfyui/output/temp_comp_h264.mp4")
+    tmp_comp_h264 = os.path.join(comfy_out, "temp_comp_h264.mp4")
+    os.system(f"docker exec comfyui ffmpeg -y -i /opt/comfyui/output/temp_comp_raw.mp4 -c:v libx264 -pix_fmt yuv420p -movflags +faststart /opt/comfyui/output/temp_comp_h264.mp4")
     shutil.copy2(tmp_comp_h264, output_master_video)
     print(f"Master output rendered: {output_master_video}")
 
@@ -276,9 +285,15 @@ if __name__ == "__main__":
     parser.add_argument("--ref", required=True, help="Path to character reference image")
     parser.add_argument("--matte", default=None, help="Optional foreground occlusion matte (e.g. tubes)")
     parser.add_argument("--output", default="final_master.mp4", help="Path to output master video")
+    parser.add_argument("--start_frame", type=int, default=0, help="Start frame index")
+    parser.add_argument("--num_frames", type=int, default=56, help="Number of frames to process")
     args = parser.parse_args()
     
-    box, dims, fps = step1_prepare_crop(args.source, args.mask)
-    h3_gen = step2_generate_minimax_h3("workflow/minimax_h3_crop_workflow.json")
-    swapped = step3_rock_solid_inswapper(h3_gen, args.ref, "temp_swapped_crop.mp4")
-    step4_pixel_perfect_composite(args.source, args.mask, args.matte, swapped, box, args.output)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    workflow_path = os.path.join(script_dir, "workflow", "minimax_h3_crop_workflow.json")
+    
+    box, dims, fps = step1_prepare_crop(args.source, args.mask, start_frame=args.start_frame, num_frames=args.num_frames)
+    h3_gen = step2_generate_minimax_h3(workflow_path)
+    out_crop = os.path.splitext(args.output)[0] + "_crop.mp4"
+    swapped = step3_rock_solid_inswapper(h3_gen, args.ref, out_crop)
+    step4_pixel_perfect_composite(args.source, args.mask, args.matte, swapped, box, args.output, start_frame=args.start_frame)
