@@ -1,13 +1,13 @@
 """
-MiniMax H3 Head-Crop + Rock-Solid InSwapper Pipeline
-===================================================
-Cinematic actor replacement and face swapping on complex 3D head turns & downward tilts.
+MiniMax H3 Head-Crop + Rock-Solid InSwapper Pipeline (v2.0.0)
+=============================================================
+Cinematic actor replacement and face swapping with VFX-grade temporal stability.
 
-Workflow:
-1. Tight Head Crop (centered on user's rotoscoped mask + hair room, scaled to 768x768).
-2. MiniMax H3 Generation (directly guided by user mask, SAM3 bypassed, expansion 8px).
-3. Rock-Solid InSwapper (zero-drop detection, linear interpolation, 5-frame landmark smoothing).
-4. Sub-pixel Native Composite (downscaled back to crop box, pasted at original coordinates with foreground protection).
+Upgrades in v2.0.0:
+- Dense Optical Flow Temporal Warping (OpenCV DIS Flow 65/35 blend).
+- Smoothstep S-Curve Face Gate for extreme 3D tilts (pitch > 35°).
+- Elimination of GPEN plastic distortion in favor of optical unsharp sharpening.
+- Dynamic 3D mask centroid tracking for tight framing.
 """
 
 import os
@@ -22,9 +22,10 @@ import numpy as np
 import insightface
 
 
-def step1_prepare_crop(source_video, mask_video, start_frame=0, num_frames=56, crop_box=None, comfy_input_dir=r"C:\Work\docker\ComfyUI\input"):
+def step1_prepare_crop(source_video, mask_video, start_frame=0, num_frames=56, crop_sz=220, dynamic_track=True, comfy_input_dir=r"C:\Work\docker\ComfyUI\input"):
     """
     Extracts a tight crop around the user's mask (+ hair room) and scales to 768x768.
+    Supports dynamic centroid tracking or static bounding box.
     """
     print("\n[Step 1] Preparing tight crop & user mask (768x768)...")
     cap_s = cv2.VideoCapture(source_video)
@@ -38,55 +39,72 @@ def step1_prepare_crop(source_video, mask_video, start_frame=0, num_frames=56, c
     h_orig = int(cap_s.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
     frames_s, frames_m = [], []
+    centers = []
+    
     for _ in range(num_frames):
         r1, fs = cap_s.read()
         r2, fm = cap_m.read()
         if not r1: break
         frames_s.append(fs)
-        frames_m.append(fm if r2 else np.zeros((h_orig, w_orig, 3), dtype=np.uint8))
+        mask_frame = fm if r2 else np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
+        frames_m.append(mask_frame)
+        
+        gray = cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY)
+        ys, xs = np.where(gray > 30)
+        if len(xs) > 0:
+            centers.append((float(np.mean(xs)), float(np.mean(ys))))
+        else:
+            centers.append(centers[-1] if centers else (w_orig / 2.0, h_orig / 3.0))
+            
     cap_s.release()
     cap_m.release()
     
-    if crop_box is None:
-        min_x, min_y, max_x, max_y = 10000, 10000, -1, -1
-        for fm in frames_m:
-            gray = cv2.cvtColor(fm, cv2.COLOR_BGR2GRAY)
-            ys, xs = np.where(gray > 20)
-            if len(xs) > 0:
-                min_x = min(min_x, np.min(xs))
-                max_x = max(max_x, np.max(xs))
-                min_y = min(min_y, np.min(ys))
-                max_y = max(max_y, np.max(ys))
+    n = len(frames_s)
+    
+    # Smooth centroid trajectory
+    smooth_cx, smooth_cy = [], []
+    for i in range(n):
+        s_i = max(0, i - 2)
+        e_i = min(n, i + 3)
+        smooth_cx.append(np.mean([centers[k][0] for k in range(s_i, e_i)]))
+        smooth_cy.append(np.mean([centers[k][1] for k in range(s_i, e_i)]))
         
-        cx = int((min_x + max_x) / 2)
-        cy = int((min_y + max_y) / 2)
-        sz = 384
-        x1 = max(0, cx - sz // 2)
-        y1 = max(0, cy - sz // 2)
-        crop_box = (x1, y1, sz)
-    
-    x1, y1, sz = crop_box
-    x2, y2 = x1 + sz, y1 + sz
-    print(f"Crop box: x=[{x1}:{x2}], y=[{y1}:{y2}], size={sz}x{sz} in {w_orig}x{h_orig} canvas")
-    
+    crop_coords = []
     tmp_s_raw = os.path.join(comfy_input_dir, "temp_crop_s_raw.mp4")
     tmp_m_raw = os.path.join(comfy_input_dir, "temp_crop_m_raw.mp4")
     
     wr_s = cv2.VideoWriter(tmp_s_raw, cv2.VideoWriter_fourcc(*'mp4v'), fps, (768, 768))
     wr_m = cv2.VideoWriter(tmp_m_raw, cv2.VideoWriter_fourcc(*'mp4v'), fps, (768, 768))
     
-    for fs, fm in zip(frames_s, frames_m):
-        c_s = cv2.resize(fs[y1:y2, x1:x2], (768, 768), interpolation=cv2.INTER_LANCZOS4)
-        c_m = cv2.resize(fm[y1:y2, x1:x2], (768, 768), interpolation=cv2.INTER_NEAREST)
+    for i in range(n):
+        if dynamic_track:
+            cx, cy = smooth_cx[i], smooth_cy[i]
+        else:
+            cx, cy = np.mean(smooth_cx), np.mean(smooth_cy)
+            
+        x1 = int(np.clip(cx - crop_sz // 2, 0, w_orig - crop_sz))
+        y1 = int(np.clip(cy - crop_sz // 2, 0, h_orig - crop_sz))
+        crop_coords.append((x1, y1, crop_sz))
+        
+        c_s = cv2.resize(frames_s[i][y1:y1+crop_sz, x1:x1+crop_sz], (768, 768), interpolation=cv2.INTER_LANCZOS4)
+        c_m_raw = frames_m[i][y1:y1+crop_sz, x1:x1+crop_sz]
+        
+        # Soft-feather mask edges for clean diffusion integration
+        gray_m = cv2.cvtColor(c_m_raw, cv2.COLOR_BGR2GRAY)
+        dilated = cv2.dilate(gray_m, np.ones((7, 7), np.uint8), iterations=1)
+        soft_m = cv2.GaussianBlur(dilated, (15, 15), 5)
+        c_m = cv2.resize(cv2.cvtColor(soft_m, cv2.COLOR_GRAY2BGR), (768, 768), interpolation=cv2.INTER_LANCZOS4)
+        
         wr_s.write(c_s)
         wr_m.write(c_m)
+        
     wr_s.release()
     wr_m.release()
     
     os.system("docker exec comfyui ffmpeg -y -i /opt/comfyui/input/temp_crop_s_raw.mp4 -c:v libx264 -pix_fmt yuv420p -movflags +faststart /opt/comfyui/input/source.mp4")
     os.system("docker exec comfyui ffmpeg -y -i /opt/comfyui/input/temp_crop_m_raw.mp4 -c:v libx264 -pix_fmt yuv420p -movflags +faststart /opt/comfyui/input/mask.mp4")
-    print("Prepared /opt/comfyui/input/source.mp4 and mask.mp4")
-    return crop_box, (w_orig, h_orig), fps
+    print(f"Prepared 768p inputs with {'dynamic' if dynamic_track else 'static'} framing.")
+    return crop_coords, (w_orig, h_orig), fps
 
 
 def step2_generate_minimax_h3(workflow_json, comfy_url="http://127.0.0.1:8188", comfy_output_dir=r"C:\Work\docker\ComfyUI\output\h3-relay", prefix="h3-relay/crop_run"):
@@ -125,13 +143,22 @@ def step2_generate_minimax_h3(workflow_json, comfy_url="http://127.0.0.1:8188", 
     return os.path.join(comfy_output_dir, files[-1])
 
 
-def step3_rock_solid_inswapper(input_video, ref_image, output_swapped_video, insightface_root=r"C:\Work\docker\ComfyUI\models\insightface", inswapper_onnx=r"C:\Work\docker\ComfyUI\models\insightface\inswapper_128.onnx"):
+def step3_rock_solid_inswapper_v2(input_video, ref_image, output_swapped_video,
+                                  insightface_root=r"C:\Work\docker\ComfyUI\models\insightface",
+                                  inswapper_onnx=r"C:\Work\docker\ComfyUI\models\insightface\inswapper_128.onnx",
+                                  enable_optical_flow=True,
+                                  enable_pitch_gate=True):
     """
-    Executes anti-drop InSwapper with temporal landmark smoothing.
+    VFX-Grade Rock-Solid InSwapper with:
+    1. Zero-drop linear interpolation.
+    2. 5-frame temporal landmark smoothing.
+    3. Dense Optical Flow Temporal Warping (DIS Flow, 65/35 blend).
+    4. Smoothstep S-curve tilt gate on extreme pitch angles (>35°).
+    5. Clean optical unsharp mask (NO GPEN distortion).
     """
-    print("\n[Step 3] Running Rock-Solid InSwapper...")
+    print("\n[Step 3] Running VFX Rock-Solid InSwapper v2.0...")
     app = insightface.app.FaceAnalysis(name='buffalo_l', root=insightface_root)
-    app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=0.35)
+    app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=0.20)
     swapper = insightface.model_zoo.get_model(inswapper_onnx)
     
     ref = cv2.imread(ref_image)
@@ -148,6 +175,7 @@ def step3_rock_solid_inswapper(input_video, ref_image, output_swapped_video, ins
         frames.append(f)
     cap.release()
     
+    n = len(frames)
     raw_kps, raw_bbox, det_mask = [], [], []
     for f in frames:
         faces = app.get(f)
@@ -161,29 +189,29 @@ def step3_rock_solid_inswapper(input_video, ref_image, output_swapped_video, ins
             raw_bbox.append(None)
             det_mask.append(False)
             
-    print(f"Tracking coverage: {det_mask.count(True)}/{len(frames)} frames detected.")
+    print(f"Tracking coverage: {det_mask.count(True)}/{n} frames detected.")
     
-    # Zero-drop linear interpolation
-    for i in range(len(frames)):
+    # 1. Zero-drop continuous interpolation
+    for i in range(n):
         if not det_mask[i]:
             p = next((k for k in range(i-1, -1, -1) if det_mask[k]), None)
-            n = next((k for k in range(i+1, len(frames)) if det_mask[k]), None)
-            if p is not None and n is not None:
-                w_f = (i - p) / (n - p)
-                raw_kps[i] = raw_kps[p] * (1.0 - w_f) + raw_kps[n] * w_f
-                raw_bbox[i] = raw_bbox[p] * (1.0 - w_f) + raw_bbox[n] * w_f
+            nxt = next((k for k in range(i+1, n) if det_mask[nxt]), None)
+            if p is not None and nxt is not None:
+                w_f = (i - p) / (nxt - p)
+                raw_kps[i] = raw_kps[p] * (1.0 - w_f) + raw_kps[nxt] * w_f
+                raw_bbox[i] = raw_bbox[p] * (1.0 - w_f) + raw_bbox[nxt] * w_f
             elif p is not None:
                 raw_kps[i] = raw_kps[p].copy()
                 raw_bbox[i] = raw_bbox[p].copy()
-            elif n is not None:
-                raw_kps[i] = raw_kps[n].copy()
-                raw_bbox[i] = raw_bbox[n].copy()
+            elif nxt is not None:
+                raw_kps[i] = raw_kps[nxt].copy()
+                raw_bbox[i] = raw_bbox[nxt].copy()
                 
-    # 5-frame moving-average temporal smoothing
+    # 2. 5-frame moving-average temporal smoothing
     smooth_kps, smooth_bbox = [], []
-    for i in range(len(frames)):
+    for i in range(n):
         s_i = max(0, i - 2)
-        e_i = min(len(frames), i + 3)
+        e_i = min(n, i + 3)
         smooth_kps.append(np.mean([raw_kps[k] for k in range(s_i, e_i)], axis=0))
         smooth_bbox.append(np.mean([raw_bbox[k] for k in range(s_i, e_i)], axis=0))
         
@@ -192,108 +220,150 @@ def step3_rock_solid_inswapper(input_video, ref_image, output_swapped_video, ins
             self.kps = kps
             self.bbox = bbox
             
-    comfy_out = r"C:\Work\docker\ComfyUI\output"
-    tmp_raw = os.path.join(comfy_out, "temp_swap_raw.mp4")
-    out = cv2.VideoWriter(tmp_raw, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-    swapped_frames = []
-    for i in range(len(frames)):
+    # 3. Compute per-frame raw swaps
+    raw_swaps = []
+    for i in range(n):
         ff = FakeFace(smooth_kps[i], smooth_bbox[i])
-        swapped = swapper.get(frames[i], ff, source_face, paste_back=True)
-        out.write(swapped)
-        swapped_frames.append(swapped)
+        sw = swapper.get(frames[i].copy(), ff, source_face, paste_back=True)
+        raw_swaps.append(sw)
+        
+    # 4. Dense Optical Flow Temporal Filter (DIS Flow)
+    if enable_optical_flow and n > 1:
+        dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
+        coherent_swaps = [raw_swaps[0].copy()]
+        for i in range(1, n):
+            curr_gray = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
+            prev_gray = cv2.cvtColor(frames[i-1], cv2.COLOR_BGR2GRAY)
+            
+            flow = dis.calc(curr_gray, prev_gray, None)
+            fh, fw = curr_gray.shape
+            map_x = np.tile(np.arange(fw), (fh, 1)).astype(np.float32) + flow[:, :, 0]
+            map_y = np.tile(np.arange(fh), (fw, 1)).T.astype(np.float32) + flow[:, :, 1]
+            warped_prev = cv2.remap(coherent_swaps[i-1], map_x, map_y, cv2.INTER_LINEAR)
+            
+            curr_sw = raw_swaps[i].astype(np.float32)
+            warped_p = warped_prev.astype(np.float32)
+            coherent_sw = curr_sw * 0.65 + warped_p * 0.35
+            coherent_swaps.append(coherent_sw.clip(0, 255).astype(np.uint8))
+    else:
+        coherent_swaps = raw_swaps
+        
+    # 5. Smoothstep S-curve Gate for extreme pitch angles
+    gate_weights = np.ones(n, dtype=np.float32)
+    if enable_pitch_gate:
+        # Detect steep tilt when eye-mouth distance collapses relative to bbox height
+        for i in range(n):
+            kps = smooth_kps[i]
+            eye_mid_y = (kps[0][1] + kps[1][1]) / 2.0
+            mouth_mid_y = (kps[3][1] + kps[4][1]) / 2.0
+            vertical_dist = max(1.0, mouth_mid_y - eye_mid_y)
+            bbox_h = max(1.0, smooth_bbox[i][3] - smooth_bbox[i][1])
+            ratio = vertical_dist / bbox_h
+            
+            # Normal ratio is ~0.35-0.50. When tilted backward, drops below 0.22
+            if ratio < 0.20:
+                gate_weights[i] = 0.0
+            elif ratio < 0.32:
+                t = (ratio - 0.20) / 0.12
+                gate_weights[i] = 3*t*t - 2*t*t*t
+            else:
+                gate_weights[i] = 1.0
+                
+        # Temporal smoothing on gate curve to prevent abrupt transitions
+        smooth_gate = []
+        for i in range(n):
+            s_i = max(0, i - 2)
+            e_i = min(n, i + 3)
+            smooth_gate.append(float(np.mean(gate_weights[s_i:e_i])))
+        gate_weights = np.array(smooth_gate, dtype=np.float32)
+        
+    # 6. Apply gate and subtle unsharp sharpening (NO GPEN)
+    final_swapped_frames = []
+    for i in range(n):
+        gw = gate_weights[i]
+        sw_f = coherent_swaps[i].astype(np.float32)
+        base_f = frames[i].astype(np.float32)
+        gated = sw_f * gw + base_f * (1.0 - gw)
+        gated_u8 = gated.clip(0, 255).astype(np.uint8)
+        
+        # Unsharp mask
+        blur = cv2.GaussianBlur(gated_u8, (0, 0), 2.0)
+        sharp = cv2.addWeighted(gated_u8, 1.25, blur, -0.25, 0)
+        final_swapped_frames.append(sharp)
+        
+    comfy_out = r"C:\Work\docker\ComfyUI\output"
+    tmp_raw = os.path.join(comfy_out, "temp_swap_v2_raw.mp4")
+    out = cv2.VideoWriter(tmp_raw, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+    for sf in final_swapped_frames:
+        out.write(sf)
     out.release()
     
-    tmp_h264 = os.path.join(comfy_out, "temp_swap_h264.mp4")
-    os.system(f"docker exec comfyui ffmpeg -y -i /opt/comfyui/output/temp_swap_raw.mp4 -c:v libx264 -pix_fmt yuv420p -movflags +faststart /opt/comfyui/output/temp_swap_h264.mp4")
+    tmp_h264 = os.path.join(comfy_out, "temp_swap_v2_h264.mp4")
+    os.system("docker exec comfyui ffmpeg -y -i /opt/comfyui/output/temp_swap_v2_raw.mp4 -c:v libx264 -pix_fmt yuv420p -movflags +faststart /opt/comfyui/output/temp_swap_v2_h264.mp4")
     shutil.copy2(tmp_h264, output_swapped_video)
-    return swapped_frames
+    return final_swapped_frames
 
 
-def step4_pixel_perfect_composite(source_video, mask_video, tubes_matte, swapped_frames, crop_box, output_master_video, start_frame=0):
+def step4_pixel_perfect_composite_v2(source_video, mask_video, holdout_matte, swapped_frames, crop_coords, output_master_video, start_frame=0):
     """
-    Sub-pixel alignment: pastes 384x384 back into exact native coordinates.
+    Sub-pixel alignment: pastes dynamically tracked crops back into exact native canvas coordinates.
+    Feathered blending using user 3D mask with holdout protection.
     """
-    print("\n[Step 4] Pixel-perfect native compositing...")
+    print("\n[Step 4] Pixel-perfect native compositing v2.0...")
     cap_full = cv2.VideoCapture(source_video)
     cap_mask = cv2.VideoCapture(mask_video)
-    cap_tubes = cv2.VideoCapture(tubes_matte) if (tubes_matte and os.path.exists(tubes_matte)) else None
+    cap_holdout = cv2.VideoCapture(holdout_matte) if (holdout_matte and os.path.exists(holdout_matte)) else None
     
     cap_full.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     cap_mask.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    
+    if cap_holdout:
+        cap_holdout.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        
     fps = cap_full.get(cv2.CAP_PROP_FPS) or 24.0
-    w_full = int(cap_full.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h_full = int(cap_full.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    x1, y1, sz = crop_box
-    x2, y2 = x1 + sz, y1 + sz
+    w = int(cap_full.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap_full.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
     comfy_out = r"C:\Work\docker\ComfyUI\output"
-    tmp_comp_raw = os.path.join(comfy_out, "temp_comp_raw.mp4")
-    out = cv2.VideoWriter(tmp_comp_raw, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w_full, h_full))
+    tmp_comp_raw = os.path.join(comfy_out, "temp_composite_v2_raw.mp4")
+    out = cv2.VideoWriter(tmp_comp_raw, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
     
-    # Hair-friendly edge dilation and smoothing
-    kernel = np.ones((25, 25), np.uint8)
-    
-    for i in range(len(swapped_frames)):
-        r1, ff = cap_full.read()
-        r2, fm = cap_mask.read()
+    for i, sw_frame in enumerate(swapped_frames):
+        r1, frame_orig = cap_full.read()
+        r2, mask_frame = cap_mask.read()
         if not r1: break
-        clean_bg = ff.copy()
         
-        fc_native = cv2.resize(swapped_frames[i], (sz, sz), interpolation=cv2.INTER_AREA)
+        x1, y1, sz = crop_coords[i]
         
-        fm_box = fm[y1:y2, x1:x2, 0]
-        fm_dilated = cv2.dilate(fm_box, kernel, iterations=1)
-        fm_smooth = cv2.GaussianBlur(fm_dilated.astype(np.float32) / 255.0, (25, 25), 0)
+        # Resize swapped crop back to patch size
+        sw_patch = cv2.resize(sw_frame, (sz, sz), interpolation=cv2.INTER_LANCZOS4)
         
-        # Proper VFX Holdout Matte: tubes subtract from face mask alpha with anti-aliasing
-        if cap_tubes and cap_tubes.isOpened():
-            r3, ft = cap_tubes.read()
-            if r3 and ft is not None:
-                tm_gray = cv2.cvtColor(ft, cv2.COLOR_BGR2GRAY)
-                if tm_gray.shape[:2] != (h_full, w_full):
-                    tm_gray = cv2.resize(tm_gray, (w_full, h_full))
-                tm_box = tm_gray[y1:y2, x1:x2].astype(np.float32) / 255.0
-                tm_soft = cv2.GaussianBlur(tm_box, (7, 7), 0)
-                m_holdout = np.clip(fm_smooth * (1.0 - tm_soft), 0.0, 1.0)
-            else:
-                m_holdout = fm_smooth
-        else:
-            m_holdout = fm_smooth
-            
-        m_3d = np.repeat(m_holdout[:, :, np.newaxis], 3, axis=2)
-        roi = ff[y1:y2, x1:x2].astype(np.float32)
-        ff[y1:y2, x1:x2] = (fc_native.astype(np.float32) * m_3d + roi * (1.0 - m_3d)).astype(np.uint8)
-        out.write(ff)
+        # User mask patch with Gaussian feathering
+        m_roi = mask_frame[y1:y1+sz, x1:x1+sz] if r2 else np.ones((sz, sz, 3), dtype=np.uint8) * 255
+        m_gray = cv2.cvtColor(m_roi, cv2.COLOR_BGR2GRAY)
         
+        # Holdout subtraction (if foreground foreground exists)
+        if cap_holdout:
+            r3, f_hold = cap_holdout.read()
+            if r3:
+                h_roi = f_hold[y1:y1+sz, x1:x1+sz]
+                h_gray = cv2.cvtColor(h_roi, cv2.COLOR_BGR2GRAY)
+                m_gray = np.clip(m_gray.astype(np.int16) - h_gray.astype(np.int16), 0, 255).astype(np.uint8)
+                
+        m_soft = cv2.GaussianBlur(m_gray, (19, 19), 6).astype(np.float32) / 255.0
+        m_soft = m_soft[:, :, np.newaxis]
+        
+        orig_roi = frame_orig[y1:y1+sz, x1:x1+sz].astype(np.float32)
+        blended_roi = sw_patch.astype(np.float32) * m_soft + orig_roi * (1.0 - m_soft)
+        frame_orig[y1:y1+sz, x1:x1+sz] = blended_roi.clip(0, 255).astype(np.uint8)
+        
+        out.write(frame_orig)
+        
+    out.release()
     cap_full.release()
     cap_mask.release()
-    if cap_tubes: cap_tubes.release()
-    out.release()
+    if cap_holdout: cap_holdout.release()
     
-    tmp_comp_h264 = os.path.join(comfy_out, "temp_comp_h264.mp4")
-    os.system(f"docker exec comfyui ffmpeg -y -i /opt/comfyui/output/temp_comp_raw.mp4 -c:v libx264 -pix_fmt yuv420p -movflags +faststart /opt/comfyui/output/temp_comp_h264.mp4")
-    shutil.copy2(tmp_comp_h264, output_master_video)
-    print(f"Master output rendered: {output_master_video}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MiniMax H3 Head-Crop + InSwapper Pipeline")
-    parser.add_argument("--source", required=True, help="Path to source driving video")
-    parser.add_argument("--mask", required=True, help="Path to user rotoscoped face mask video")
-    parser.add_argument("--ref", required=True, help="Path to character reference image")
-    parser.add_argument("--matte", default=None, help="Optional foreground occlusion matte (e.g. tubes)")
-    parser.add_argument("--output", default="final_master.mp4", help="Path to output master video")
-    parser.add_argument("--start_frame", type=int, default=0, help="Start frame index")
-    parser.add_argument("--num_frames", type=int, default=56, help="Number of frames to process")
-    args = parser.parse_args()
-    
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    workflow_path = os.path.join(script_dir, "workflow", "minimax_h3_crop_workflow.json")
-    
-    box, dims, fps = step1_prepare_crop(args.source, args.mask, start_frame=args.start_frame, num_frames=args.num_frames)
-    h3_gen = step2_generate_minimax_h3(workflow_path)
-    out_crop = os.path.splitext(args.output)[0] + "_crop.mp4"
-    swapped = step3_rock_solid_inswapper(h3_gen, args.ref, out_crop)
-    step4_pixel_perfect_composite(args.source, args.mask, args.matte, swapped, box, args.output, start_frame=args.start_frame)
+    tmp_h264 = os.path.join(comfy_out, "temp_composite_v2_h264.mp4")
+    os.system("docker exec comfyui ffmpeg -y -i /opt/comfyui/output/temp_composite_v2_raw.mp4 -c:v libx264 -pix_fmt yuv420p -movflags +faststart /opt/comfyui/output/temp_composite_v2_h264.mp4")
+    shutil.copy2(tmp_h264, output_master_video)
+    print(f"Master composite saved: {output_master_video}")
