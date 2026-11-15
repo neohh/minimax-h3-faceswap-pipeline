@@ -1,13 +1,29 @@
-# MiniMax H3 Head-Crop + Rock-Solid InSwapper Pipeline 🎬🎭
+# MiniMax H3 Head-Crop + Universal Hero Prop & Rock-Solid InSwapper Pipeline 🎬🎭📦
 
 [![GitHub Release](https://img.shields.io/github/v/release/neohh/minimax-h3-faceswap-pipeline)](https://github.com/neohh/minimax-h3-faceswap-pipeline/releases)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-H3--Relay-orange.svg)](https://github.com/comfyanonymous/ComfyUI)
+[![Sammie-Roto](https://img.shields.io/badge/Sammie--Roto-SAM%202.1%20Large-purple.svg)](tools/sammie_bridge)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-A production-grade, 4-stage hybrid pipeline for cinematic actor replacement and face swapping on complex 3D head turns, profile rotations ($90^\circ$), and steep perspective tilts.
+A production-grade, 4-stage hybrid studio pipeline for cinematic actor replacement, face swapping on complex 3D head turns ($90^\circ$ profile, steep perspective tilts), and **micro-detail hero prop replacement** (packaging, typography, newspapers, objects).
 
-Combines the 3D volumetric consistency of **MiniMax H3 (`ref2va` DiT)** with the pixel-perfect identity likeness of **InSwapper**, featuring **VFX-Grade Optical Flow Temporal Warping** and **S-Curve Pitch Gating** to eliminate frame flickering, facial drift, and plastic AI mouth distortion.
+Combines the 3D volumetric consistency of **MiniMax H3 (`ref2va` DiT)** with the pixel-perfect identity likeness of **InSwapper**, featuring **VFX-Grade Optical Flow Temporal Warping**, **S-Curve Pitch Gating**, and the new **Zero-Click Sammie-Roto (SAM 2.1 Large) Studio Bridge**.
+
+---
+
+## 🚀 What's New in v2.5.0: The Studio Release — Universal Props & Zero-Click Roto Bridge
+
+* **⚡ Zero-Click Sammie-Roto Studio IPC Bridge (`tools/sammie_bridge`)**:
+  * Seamless bi-directional automation between the agent/pipeline and **Sammie-Roto (Meta SAM 2.1 Large + MatAnyone 2)**.
+  * **Hot-Reload Timeline on the Fly**: Instantly swaps the active video timeline via a lightweight IPC command channel (`temp/sammie_ipc_command.json`) without unloading or re-initializing SAM2 models from VRAM (RTX 5080).
+  * **Auto-Export Manifest Handshake**: Whenever a mask is exported, Sammie-Roto automatically logs `temp/latest_export.json` with the exact path. The pipeline grabs the fresh mask in 0.001s with zero manual path entry.
+  * **Native Drag & Drop Tool**: Standalone `Загрузить_видео_в_Sammie.exe` and `Sammie-Roto.exe` with embedded visual icons for 1-click video staging.
+* **📦 Beyond Faces: Universal Hero Props & Full Characters**:
+  * Extends the 4-stage Dynamic Zoom architecture to solve **micro-typography and prop replacement** (e.g. cigarette packs with legible text, newspapers with column print, glass reflection).
+  * Uses a two-pass strategy: Pass 1 establishes global scene/environmental lighting, and Pass 2 isolates the hero prop in a dynamic high-resolution crop ($768\text{p}$) to overcome the $8\times$ DiT latent compression bottleneck.
+* **🎬 High-Speed Side-by-Side Reviewer (`combine_side_by_side.py`)**:
+  * Fast PyAV/libx264 multi-threaded tool to render synchronous Original vs Mask split-screen videos with frame counters for instant QA verification.
 
 ---
 
@@ -45,31 +61,35 @@ Full Canvas (720x1280) ──> Face is ONLY 50x70 px! ──> VAE 8x compression
 
 ---
 
-## 💡 The Solution: 4-Stage Hybrid Pipeline
+## 💡 The Solution: 4-Stage Hybrid Studio Pipeline
 
 ```mermaid
 flowchart LR
-    A["1. User-Mask Head Crop<br/>(Dynamic Centroid -> 768p Zoom)"] --> B["2. MiniMax H3 Generation<br/>(Direct User Mask, 8px Edge)"]
-    B --> C["3. VFX Rock-Solid InSwapper<br/>(DIS Optical Flow + S-Curve Gate)"]
+    Roto["Sammie-Roto Studio<br/>(Meta SAM 2.1 Large)"] -->|Zero-Click IPC Mask| A["1. Dynamic Centroid Crop<br/>(Face or Hero Prop -> 768p Zoom)"]
+    A --> B["2. MiniMax H3 Generation<br/>(Direct Mask, 8px Edge)"]
+    B --> C["3. Dual-Mode Stage 3:<br/>A: InSwapper (DIS Flow + S-Curve)<br/>B: Hero Prop Detailer (Micro-Text)"]
     C --> D["4. Sub-Pixel Composite<br/>(Native Canvas + Matte Protection)"]
 ```
 
-### Stage 1: Dynamic Head Crop (768p Zoom)
-Instead of wasting 96% of the GPU compute budget on background tables and streets, the script extracts a $220 \times 220$ px box dynamically centered around the user's rotoscoped face mask (with margins for hair curls and collar), upscaling it to native **$768 \times 768$**.
-* **Face resolution jumps from 50 px to 500 px** ($10\times$ increase).
-* **Each eye grows to ~50 px** — the VAE now has dozens of latent tokens to cleanly preserve eyelid curvature and perspective foreshortening.
+### Stage 1: Dynamic Centroid Crop (768p Zoom)
+Instead of wasting 96% of the GPU compute budget on background tables and streets, the script extracts a dynamic bounding box centered around the target's rotoscoped mask (generated in 1-click via the **Sammie-Roto Studio Bridge**), upscaling it to native **$768 \times 768$**.
+* **Face / Prop resolution jumps $10\times$**: In a wide shot, a $50\text{px}$ face or cigarette pack becomes $500\text{px}$.
+* **Latent token preservation**: Overcomes the $8\times$ VAE downsampling limit. Eyelids or micro-typography ("КОСМОС", newspaper print columns) now occupy dozens of latent tokens instead of collapsing into blurred blobs.
 
 ### Stage 2: MiniMax H3 with Direct Mask Guidance
-* Automated SAM3 person segmentation is bypassed.
+* Automated person segmentation is bypassed.
 * The user's hand-crafted video mask (`mask.mp4`) is fed directly into `H3RelayExpandMask` with a tight `expansion_px: 8`.
-* MiniMax H3 replaces only the face and hair, using the undisturbed original hair and neck as rigid geometric anchors.
+* MiniMax H3 replaces only the targeted object or head, using undisturbed surroundings as rigid geometric anchors.
 
-### Stage 3: VFX Rock-Solid InSwapper (Temporal Coherence)
-* **Adaptive Thresholding**: SCRFD detection threshold lowered to $0.20$ for steep profile angles.
-* **Zero-Drop Continuous Interpolation**: Continuous linear trajectory bridge across extreme occlusion frames.
-* **5-Frame Moving-Average Smoothing**: Filters high-frequency landmark jitter, completely eliminating mesh twitching.
-* **DIS Optical Flow Temporal Warping**: Seamlessly links consecutive frames, eliminating temporal noise.
-* **S-Curve Face Gate**: Smoothly modulates swap intensity across extreme perspective tilts.
+### Stage 3: Dual-Mode Detailer
+* **Mode A: Actor Likeness (VFX Rock-Solid InSwapper)**:
+  * Adaptive SCRFD detection threshold ($0.20$) for steep profiles.
+  * Zero-Drop Continuous Interpolation across extreme occlusions.
+  * 5-Frame moving average landmark smoothing.
+  * **DIS Optical Flow Temporal Warping**: Rigidity links consecutive frames.
+  * **S-Curve Face Gate**: Smoothly modulates swap intensity across extreme perspective tilts.
+* **Mode B: Hero Prop & Object Detailer (Micro-Text & Print)**:
+  * High-resolution second-pass latent refinement for fine typography, logos, packaging, and specular glassware.
 
 ### Stage 4: Sub-Pixel Native Compositing & Foreground Protection
 * The swapped $768\text{p}$ head is downsampled back to native patch coordinates and pasted directly into the native canvas.
@@ -131,6 +151,30 @@ step4_pixel_perfect_composite_v2(
     output_master_video="final_master_output.mp4"
 )
 ```
+
+---
+
+## 🖌️ Zero-Click Sammie-Roto Studio Bridge
+
+Located in [`tools/sammie_bridge/`](tools/sammie_bridge/):
+
+![Sammie-Roto Studio Preview](assets/sammie_roto_studio_preview.jpg)
+
+The pipeline integrates seamlessly with **Sammie-Roto (Meta SAM 2.1 Large + MatAnyone 2)** for instant, zero-friction rotoscoping:
+
+1. **Launch Studio**: Run `Sammie-Roto.exe` (or `Sammie-Roto.bat`).
+2. **Hot-Reload Video into Timeline**:
+   ```bash
+   python tools/sammie_bridge/send_to_sammie.py "path/to/video.mp4"
+   ```
+   Or drag-and-drop any video directly onto `Загрузить_видео_в_Sammie.exe` on your desktop.
+3. **Rotoscoping**: Click positive/negative points on the face or object, hit **Propagate** (SAM 2.1 Large), and click **Export**.
+4. **Zero-Click Handshake**: Sammie-Roto automatically writes `temp/latest_export.json`. The pipeline immediately detects the exported mask path and begins Stage 1.
+5. **Quality Verification**:
+   ```bash
+   python tools/sammie_bridge/combine_side_by_side.py
+   ```
+   Generates a synchronized split-screen comparison video (Original vs Mask) to verify boundary tightness before inpainting.
 
 ---
 
