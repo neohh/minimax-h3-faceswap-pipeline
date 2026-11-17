@@ -191,12 +191,38 @@ def run_neural_projection(
 
     pts0_gpu = torch.from_numpy(smoothed_tracks[0]).float().to(device)
 
-    # Dynamic bounding box
+    # Dynamic bounding box encompassing all active mask regions and tracked points
+    all_mask_ys, all_mask_xs = [], []
+    for m in masks:
+        ys, xs = np.where(m > 10)
+        if len(xs) > 0:
+            all_mask_xs.append(xs.min())
+            all_mask_xs.append(xs.max())
+            all_mask_ys.append(ys.min())
+            all_mask_ys.append(ys.max())
+
+    if len(all_mask_xs) > 0:
+        mask_min_x, mask_max_x = min(all_mask_xs), max(all_mask_xs)
+        mask_min_y, mask_max_y = min(all_mask_ys), max(all_mask_ys)
+    else:
+        mask_min_x, mask_max_x, mask_min_y, mask_max_y = 0, w, 0, h
+
     pts_all = smoothed_tracks.reshape(-1, 2)
-    min_x = max(0, int(np.min(pts_all[:, 0])) - 40)
-    max_x = min(w, int(np.max(pts_all[:, 0])) + 40)
-    min_y = max(0, int(np.min(pts_all[:, 1])) - 40)
-    max_y = min(h, int(np.max(pts_all[:, 1])) + 40)
+    pts_min_x = int(np.min(pts_all[:, 0]))
+    pts_max_x = int(np.max(pts_all[:, 0]))
+    pts_min_y = int(np.min(pts_all[:, 1]))
+    pts_max_y = int(np.max(pts_all[:, 1]))
+
+    min_x = max(0, min(mask_min_x, pts_min_x) - 40)
+    max_x = min(w, max(mask_max_x, pts_max_x) + 40)
+    min_y = max(0, min(mask_min_y, pts_min_y) - 40)
+    max_y = min(h, max(mask_max_y, pts_max_y) + 40)
+
+    # If bounds approach image edges (within 50px), snap to frame boundary to prevent any crop seam
+    if min_x <= 50: min_x = 0
+    if max_x >= w - 50: max_x = w
+    if min_y <= 50: min_y = 0
+    if max_y >= h - 50: max_y = h
 
     grid_y, grid_x = torch.meshgrid(
         torch.arange(min_y, max_y, device=device, dtype=torch.float32),
