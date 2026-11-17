@@ -18,45 +18,43 @@ When doing cinematic object replacement (such as placing authentic Soviet newspa
 
 ---
 
-## 🔬 Mathematical Architecture of Smooth-MLS
+## 🔬 Mathematical Architecture of Depth-Aware Smooth-MLS
 
-Block 3 solves all four failure modes by combining deep transformer point tracking with smooth differential geometry:
+Block 3 solves all failure modes by combining deep transformer point tracking, 3D bilateral depth decoupling, and smooth differential geometry:
 
 ```
-Video Plate + Roto Mask (Frame 0..T)
-               │
-               ▼
-   [CoTracker3 Transformer]
-               │  (Tracks 78+ 3D ground-truth points across entire shot)
-               ▼
-   [Savitzky-Golay Filter]
-               │  (window=7, poly=2; kills high-frequency jitter: σ = 0.25 px)
-               ▼
-   [Vectorized GPU Smooth-MLS]
-               │  (C1-continuous deformation; R_reg=400, α=0.5; zero jello ripple)
-               ▼
-   [Bicubic Grid-Sampling]
-               │  (Samples Master Hero Frame 0 in PyTorch GPU)
-               ▼
- [Organic Overscan & Alpha-Clip]
-               │  (7px morphological dilation + Gaussian feathering)
-               ▼
-     Final Cinematic Composite
+Video Plate + Roto Mask + Depth Map Video (Frame 0..T)
+                          │
+                          ▼
+              [CoTracker3 Transformer]
+                          │  (Tracks 78+ 3D ground-truth points across entire shot)
+                          ▼
+              [Savitzky-Golay Filter]
+                          │  (window=7, poly=2; kills high-frequency jitter: σ = 0.25 px)
+                          ▼
+     [Depth-Aware Bilateral Smooth-MLS]
+                          │  (w = w_space * exp(-ΔD^2 / 2σ_d^2); decouples 3D objects)
+                          ▼
+     [Flow Field Gaussian Smoothing]
+                          │  (GaussianBlur on dx, dy with k=31; silences micro-ripples)
+                          ▼
+            [Bicubic Grid-Sampling]
+                          │  (Samples Master Hero Frame 0 in PyTorch GPU)
+                          ▼
+       [Organic Overscan & Alpha-Clip]
+                          │  (7px morphological dilation + Gaussian feathering)
+                          ▼
+              Final Cinematic Composite
 ```
 
-### 1. Temporal Smoothing (Savitzky-Golay)
-CoTracker3 provides drift-free long-term tracking, but deep neural features introduce minor frame-to-frame subpixel jitter ($\approx 0.2\text{--}0.4$ px). Before computing spatial deformation, point trajectories $(x_i(t), y_i(t))$ are passed through a temporal polynomial filter:
-$$\tilde{x}_i(t) = \sum_{k=-m}^{m} c_k \, x_i(t + k)$$
-This reduces corner trajectory variance from $38.46$ px down to $0.25$ px without introducing phase lag.
+### 1. Depth-Aware Bilateral Weighting (3D Layer Isolation)
+When raised 3D objects (like a cigarette pack standing 4 cm above a table) share a scene with flat objects (newspaper), 3D parallax causes differing motion vectors. Bilateral weighting penalizes depth divergence:
+$$w_i(v) = \frac{1}{\|v - q_i(t)\|^{2\alpha} + R_{\text{reg}}} \cdot \exp\left(-\frac{|D(v) - D(q_i)|^2}{2\sigma_{\text{depth}}^2}\right)$$
+- If pixel $v$ is on the newspaper ($D \approx 18$) and point $q_i$ is on the pack ($D \approx 103$), the weight drops to zero. Points on the pack never deform the paper.
 
-### 2. Smooth Moving Least Squares (Smooth-MLS)
-Unlike Delaunay triangulation (which partitions the plane into independent linear facets), Moving Least Squares computes a spatially continuous non-linear mapping for every pixel $v \in \mathbb{R}^2$:
-$$w_i(v) = \frac{1}{\|v - q_i(t)\|^{2\alpha} + R_{\text{reg}}}$$
-- **Radius Regularization ($R_{\text{reg}} = 400.0$, $R = 20$ px):** Softens the inverse-distance singularity, eliminating localized weight funnels and the wavy "jello effect".
-- **Broad Exponent ($\alpha = 0.5$):** Distributes deformation smoothly across planar surfaces, preserving rigidity.
-
-### 3. Dynamic Overscan & Organic Alpha-Clipping
-Instead of clipping to the convex hull of tracked points, the warped hero texture is rendered with a 40px bounding-box overscan. It is then seamlessly composited using the frame's dilated and Gaussian-feathered roto mask ($k = 7$ px, $\sigma = 1.8$), ensuring zero border seams.
+### 2. Golden Regularization & Flow Field Smoothing
+- **Golden Parameters:** $R_{\text{reg}} = 250.0, \alpha = 0.65$ provides the optimal planar rigidity without global centroid pull.
+- **Flow Field Smoothing ($k=31$):** Gaussian blur applied directly to the displacement field $(dx, dy)$ eliminates high-frequency surface wrinkling while preserving exact subpixel boundary anchors.
 
 ---
 
@@ -68,6 +66,7 @@ tools\neural_projection\neural_projection.bat ^
     --video "path\to\plate.mp4" ^
     --mask "path\to\mask.mp4" ^
     --hero "path\to\hero_frame0.png" ^
+    --depth "path\to\depth_map.mp4" ^
     --output "path\to\master_composite.mp4"
 ```
 
@@ -79,16 +78,20 @@ run_neural_projection(
     video_path="input/plate.mp4",
     mask_path="input/mask_props.mp4",
     hero_path="input/hero_frame0.png",
-    output_path="output/master_pass21.mp4",
+    output_path="output/master_final.mp4",
+    depth_path="input/depth_map.mp4",
     grid_size=35,
-    alpha=0.5,
-    r_reg=400.0,
+    alpha=0.65,
+    r_reg=250.0,
+    sigma_depth=25.0,
+    flow_blur=31,
     savgol_window=7,
     savgol_poly=2,
     dilate_px=7,
     feather_sigma=1.8,
     save_gif=True
 )
+```
 ```
 
 ### CLI Parameters Reference

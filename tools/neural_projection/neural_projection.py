@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-CoTracker3 + Smooth Moving Least Squares (MLS) Neural Projection Engine
+CoTracker3 + Depth-Aware Smooth MLS Neural Projection Engine
 Part of the VFX Studio Trifecta: Block 3 - Precision Temporal Texture Projection
 
 Eliminates:
 - 2D Optical Flow Accumulated Drift (subpixel drift over time)
 - Delaunay Triangulation Facet Seams & Polygonal Cuts
 - Jello Effect / Wavy Micro-Rippling from steep weight funnels
-- Hard Edge Artifacts via Organic Alpha-Clipping with Overscan
+- Non-coplanar 3D parallax warping via Depth-Aware Bilateral Weighting
+- Flow field micro-noise via Gaussian displacement smoothing
 
 Authors: neohh & Antigravity DeepMind Team
 """
@@ -18,6 +19,7 @@ import sys
 import cv2
 import numpy as np
 import torch
+
 try:
     from scipy.signal import savgol_filter
 except ImportError:
@@ -28,7 +30,6 @@ except ImportError:
         elif window_length == 5 and polyorder <= 2:
             coeffs = np.array([-3, 12, 17, 12, -3], dtype=np.float32) / 35.0
         else:
-            # Simple moving average fallback if custom window not hardcoded
             coeffs = np.ones(window_length, dtype=np.float32) / float(window_length)
         
         pad_w = window_length // 2
@@ -37,23 +38,42 @@ except ImportError:
         return smoothed
 
 
-def mls_smooth_field(p, q, v, alpha=0.5, r_reg=400.0, device='cuda'):
+def mls_smooth_field(
+    p, q, v,
+    alpha=0.65,
+    r_reg=250.0,
+    d_flat_gpu=None,
+    pts_depth_gpu=None,
+    sigma_d=25.0,
+    device='cuda'
+):
     """
-    Computes a C1-continuous smooth deformation field using Moving Least Squares (MLS).
+    Computes a C1-continuous smooth deformation field using Moving Least Squares (MLS)
+    with optional Depth-Aware Bilateral Weighting.
     
     p: (N, 2) source anchor points in Frame 0
     q: (N, 2) deformed anchor points in Frame t (from CoTracker3)
     v: (H, W, 2) coordinate grid in destination frame
-    alpha: decay exponent (0.5 for broad, wave-free weighting)
-    r_reg: radius regularization constant (R^2 = 20^2 = 400 px) to prevent potential funnels
+    alpha: decay exponent (default: 0.65)
+    r_reg: radius regularization constant (default: 250.0)
+    d_flat_gpu: (H*W,) depth values of destination grid (optional)
+    pts_depth_gpu: (N,) depth values of tracked points (optional)
+    sigma_d: depth bilateral bandwidth (default: 25.0)
     """
     H, W, _ = v.shape
     v_flat = v.view(-1, 2) # (M, 2)
     
-    # Distance matrix between destination grid and tracked points: (M, N)
-    diff = v_flat.unsqueeze(1) - q.unsqueeze(0)
+    diff = v_flat.unsqueeze(1) - q.unsqueeze(0) # (M, N, 2)
     dist_sq = torch.sum(diff ** 2, dim=-1) + r_reg
-    w = 1.0 / (dist_sq ** alpha)
+    w_space = 1.0 / (dist_sq ** alpha)
+    
+    if d_flat_gpu is not None and pts_depth_gpu is not None:
+        d_diff = torch.abs(d_flat_gpu.unsqueeze(1) - pts_depth_gpu.unsqueeze(0))
+        w_depth = torch.exp(- (d_diff ** 2) / (2.0 * (sigma_d ** 2)))
+        w = w_space * w_depth + 1e-6
+    else:
+        w = w_space
+        
     w_sum = torch.sum(w, dim=1, keepdim=True)
     
     # Centroids
@@ -86,9 +106,12 @@ def run_neural_projection(
     mask_path: str,
     hero_path: str,
     output_path: str,
+    depth_path: str = None,
     grid_size: int = 35,
-    alpha: float = 0.5,
-    r_reg: float = 400.0,
+    alpha: float = 0.65,
+    r_reg: float = 250.0,
+    sigma_depth: float = 25.0,
+    flow_blur: int = 31,
     savgol_window: int = 7,
     savgol_poly: int = 2,
     dilate_px: int = 7,
@@ -116,6 +139,20 @@ def run_neural_projection(
     h, w = orig_bgr[0].shape[:2]
     print(f"[+] Loaded {N} frames ({w}x{h}).")
 
+    # Load Depth Video if provided
+    depth_frames = []
+    if depth_path and os.path.exists(depth_path):
+        print(f"[*] Loading Depth Map Video: {depth_path}")
+        cap_d = cv2.VideoCapture(depth_path)
+        while True:
+            ret, f = cap_d.read()
+            if not ret: break
+            depth_frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY))
+        cap_d.release()
+        print(f"[+] Loaded {len(depth_frames)} depth frames.")
+    else:
+        print("[*] No depth map provided. Running in pure 2D Spatial MLS mode.")
+
     print(f"[*] Reading props mask: {mask_path}")
     cap_m = cv2.VideoCapture(mask_path)
     masks = []
@@ -125,7 +162,6 @@ def run_neural_projection(
         masks.append(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY))
     cap_m.release()
     if len(masks) == 0:
-        # Fallback to single static image mask
         m_static = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if m_static is None:
             raise ValueError(f"Could not read mask from {mask_path}")
@@ -146,7 +182,7 @@ def run_neural_projection(
     num_pts = raw_tracks.shape[1]
     print(f"[+] CoTracker3 locked {num_pts} ground-truth 3D points.")
 
-    # 1. Temporal Savitzky-Golay filter to eliminate subpixel micro-jitter
+    # Temporal Savitzky-Golay filter
     print(f"[*] Applying Savitzky-Golay temporal smoothing (window={savgol_window}, poly={savgol_poly})...")
     smoothed_tracks = np.zeros_like(raw_tracks)
     for i in range(num_pts):
@@ -155,7 +191,7 @@ def run_neural_projection(
 
     pts0_gpu = torch.from_numpy(smoothed_tracks[0]).float().to(device)
 
-    # 2. Determine dynamic bounding box with overscan margin
+    # Dynamic bounding box
     pts_all = smoothed_tracks.reshape(-1, 2)
     min_x = max(0, int(np.min(pts_all[:, 0])) - 40)
     max_x = min(w, int(np.max(pts_all[:, 0])) + 40)
@@ -178,16 +214,43 @@ def run_neural_projection(
     kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px, dilate_px))
     final_frames = []
 
-    print("[*] Projecting texture across all frames via Smooth-MLS & Alpha-Clipping...")
+    print("[*] Projecting texture across all frames via Depth-Aware Smooth MLS & Alpha-Clipping...")
     for t in range(N):
-        pts_t_gpu = torch.from_numpy(smoothed_tracks[t]).float().to(device)
+        pts_t = smoothed_tracks[t]
+        pts_t_gpu = torch.from_numpy(pts_t).float().to(device)
         
+        # Depth maps if available
+        d_flat_gpu = None
+        pts_depth_gpu = None
+        if len(depth_frames) > t:
+            d_curr = depth_frames[t].astype(np.float32)
+            pts_depth = [d_curr[int(np.clip(pt[1], 0, h - 1)), int(np.clip(pt[0], 0, w - 1))] for pt in pts_t]
+            pts_depth_gpu = torch.tensor(pts_depth, device=device, dtype=torch.float32)
+            d_crop = d_curr[min_y:max_y, min_x:max_x]
+            d_flat_gpu = torch.from_numpy(d_crop.reshape(-1)).to(device)
+            
         # Deformation field
-        V_field = mls_smooth_field(pts0_gpu, pts_t_gpu, v_grid, alpha=alpha, r_reg=r_reg, device=device)
+        V_field = mls_smooth_field(
+            pts0_gpu, pts_t_gpu, v_grid,
+            alpha=alpha, r_reg=r_reg,
+            d_flat_gpu=d_flat_gpu, pts_depth_gpu=pts_depth_gpu, sigma_d=sigma_depth,
+            device=device
+        )
         
-        # Bicubic grid sampling
-        norm_x = (V_field[..., 0] / (w - 1.0)) * 2.0 - 1.0
-        norm_y = (V_field[..., 1] / (h - 1.0)) * 2.0 - 1.0
+        # Flow Field Gaussian Smoothing if enabled
+        if flow_blur > 0:
+            dx = (V_field[..., 0] - v_grid[..., 0]).cpu().numpy()
+            dy = (V_field[..., 1] - v_grid[..., 1]).cpu().numpy()
+            dx_b = cv2.GaussianBlur(dx, (flow_blur, flow_blur), 0)
+            dy_b = cv2.GaussianBlur(dy, (flow_blur, flow_blur), 0)
+            V_smooth_x = torch.from_numpy(v_grid[..., 0].cpu().numpy() + dx_b).to(device)
+            V_smooth_y = torch.from_numpy(v_grid[..., 1].cpu().numpy() + dy_b).to(device)
+        else:
+            V_smooth_x = V_field[..., 0]
+            V_smooth_y = V_field[..., 1]
+            
+        norm_x = (V_smooth_x / (w - 1.0)) * 2.0 - 1.0
+        norm_y = (V_smooth_y / (h - 1.0)) * 2.0 - 1.0
         grid_norm = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0)
         
         warped_crop = torch.nn.functional.grid_sample(
@@ -231,14 +294,17 @@ def run_neural_projection(
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="CoTracker3 + Smooth-MLS Neural Texture Projection Engine")
+    parser = argparse.ArgumentParser(description="CoTracker3 + Depth-Aware Smooth MLS Neural Texture Projection Engine")
     parser.add_argument('--video', type=str, required=True, help="Input plate video MP4")
     parser.add_argument('--mask', type=str, required=True, help="Props mask video MP4 or image")
     parser.add_argument('--hero', type=str, required=True, help="Master Hero Frame 0 image")
     parser.add_argument('--output', type=str, required=True, help="Output master video MP4")
+    parser.add_argument('--depth', type=str, default=None, help="Depth Map video MP4 for Bilateral 3D separation")
     parser.add_argument('--grid_size', type=int, default=35, help="CoTracker3 grid query density")
-    parser.add_argument('--alpha', type=float, default=0.5, help="MLS weight decay factor")
-    parser.add_argument('--r_reg', type=float, default=400.0, help="MLS radius regularization (R^2)")
+    parser.add_argument('--alpha', type=float, default=0.65, help="MLS weight decay factor")
+    parser.add_argument('--r_reg', type=float, default=250.0, help="MLS radius regularization (R^2)")
+    parser.add_argument('--sigma_d', type=float, default=25.0, help="Bilateral depth bandwidth")
+    parser.add_argument('--flow_blur', type=int, default=31, help="Displacement field Gaussian smoothing kernel")
     parser.add_argument('--savgol_window', type=int, default=7, help="Savitzky-Golay window length")
     parser.add_argument('--savgol_poly', type=int, default=2, help="Savitzky-Golay polynomial order")
     parser.add_argument('--dilate', type=int, default=7, help="Mask boundary dilation kernel size")
@@ -250,9 +316,12 @@ if __name__ == '__main__':
         mask_path=args.mask,
         hero_path=args.hero,
         output_path=args.output,
+        depth_path=args.depth,
         grid_size=args.grid_size,
         alpha=args.alpha,
         r_reg=args.r_reg,
+        sigma_depth=args.sigma_d,
+        flow_blur=args.flow_blur,
         savgol_window=args.savgol_window,
         savgol_poly=args.savgol_poly,
         dilate_px=args.dilate,
